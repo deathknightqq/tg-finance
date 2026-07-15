@@ -1,0 +1,9 @@
+[project]
+name = "finbot"
+version = "0.1.0"
+description = "Telegram-бот финансового учёта поверх PDF-выписок Kaspi"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
