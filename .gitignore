@@ -1,0 +1,14 @@
+# Секреты и локальные настройки
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Данные (БД и любые выписки — в git не попадают)
+*.db
+*.sqlite3
+data/
+*.pdf
