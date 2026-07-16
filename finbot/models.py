@@ -14,7 +14,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 SEED_CATEGORIES = [
     "продукты", "кафе и доставка", "транспорт", "подписки", "связь",
     "аптека", "коммуналка", "дом/быт", "наличка", "транзит", "семья",
-    "развлечения", "прочее",
+    "развлечения", "доход", "прочее",
 ]
 
 
@@ -94,6 +94,14 @@ class Counterparty(Base):
         ForeignKey("categories.id"), default=None
     )
     default_ownership: Mapped[str] = mapped_column(String(16), default="mine")
+    # Для контрагентов со смешанными знаками входящие могут размечаться
+    # отдельно; NULL — использовать основные category_id/default_ownership.
+    category_id_in: Mapped[int | None] = mapped_column(
+        ForeignKey("categories.id"), default=None
+    )
+    default_ownership_in: Mapped[str | None] = mapped_column(
+        String(16), default=None
+    )
     netting_rule: Mapped[str | None] = mapped_column(String(16), default=None)
 
 
@@ -124,3 +132,5 @@ class QuestionQueue(Base):
     counterparty_id: Mapped[int] = mapped_column(ForeignKey("counterparties.id"))
     weight: Mapped[int]  # Σ|сумма| × частота, тиыны
     status: Mapped[str] = mapped_column(String(16), default="pending")
+    direction: Mapped[str] = mapped_column(String(3), default="all")  # all|in|out
+    qtype: Mapped[str] = mapped_column(String(12), default="category")  # category|netting

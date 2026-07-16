@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from finbot.categorize import autocategorize
 from finbot.ingest import file_sha256, ingest_statement
+from finbot.netting import scan_pairs
 from finbot.models import User
 from finbot.parser import (
     GoldenRuleError,
@@ -57,6 +58,7 @@ def process_pdf(session: Session, tg_id: int, name: str, pdf_bytes: bytes) -> st
         return "Этот файл уже загружали — ничего не добавил."
 
     cat = autocategorize(session, user)
+    net = scan_pairs(session, user)
 
     h = parsed.header
     lines = [
@@ -73,4 +75,8 @@ def process_pdf(session: Session, tg_id: int, name: str, pdf_bytes: bytes) -> st
         lines.append(f"Разметил по правилам и словарю: {cat.assigned}")
     if cat.queued:
         lines.append(f"Нашёл {cat.queued} неизвестных контрагентов.")
+    if net.collapsed:
+        lines.append(f"Схлопнул пар возвратов по known-правилам: {net.collapsed}")
+    if net.questions:
+        lines.append(f"Нашёл похожие на возвраты пары: {net.questions} — спрошу.")
     return "\n".join(lines)

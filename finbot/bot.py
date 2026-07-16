@@ -32,6 +32,7 @@ from finbot.categorize import (
     skip_question,
 )
 from finbot.db import init_db, make_engine, make_session_factory
+from finbot.netting import apply_netting_answer, scan_pairs
 from finbot.pipeline import get_or_create_user, process_pdf
 
 logger = logging.getLogger(__name__)
@@ -78,8 +79,9 @@ async def cmd_unsorted(message: Message) -> None:
                 message.from_user.first_name or "без имени",
             )
             # доразметка хвостов: транзакции, загруженные до появления
-            # категоризации, попадают в очередь отсюда
+            # категоризации/неттинга, попадают в очередь отсюда
             autocategorize(session, user)
+            scan_pairs(session, user)
             return next_questions(session, user, BATCH_SIZE), pending_count(
                 session, user
             ), _keyboards(session, user)
@@ -183,6 +185,27 @@ def _batch_footer_kb() -> InlineKeyboardMarkup:
     )
 
 
+_DIRECTION_LABEL = {"in": " (входящие ➕)", "out": " (исходящие ➖)", "all": ""}
+
+
+def _netting_kb(queue_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🧹 схлопнуть, не считать",
+                    callback_data=f"net:{queue_id}:collapse",
+                ),
+                InlineKeyboardButton(
+                    text="👁 показывать отдельно",
+                    callback_data=f"net:{queue_id}:show",
+                ),
+            ],
+            [InlineKeyboardButton(text="⏭ потом", callback_data=f"skp:{queue_id}")],
+        ]
+    )
+
+
 async def _send_batch(
     message: Message,
     questions: list[QuestionView],
@@ -191,8 +214,19 @@ async def _send_batch(
 ) -> None:
     for q in questions:
         examples = "\n".join(q.examples)
+        if q.qtype == "netting":
+            text = (
+                f"↔️ <b>{q.display_name}</b> — похоже на возврат/встречные "
+                f"операции ({q.tx_count} пар):\n{examples}\n"
+                "Схлопнуть пару и не считать в статистике?"
+            )
+            await message.answer(
+                text, reply_markup=_netting_kb(q.queue_id), parse_mode="HTML"
+            )
+            continue
+        label = _DIRECTION_LABEL.get(q.direction, "")
         text = (
-            f"❓ <b>{q.display_name}</b> — {q.tx_count} операц.\n{examples}"
+            f"❓ <b>{q.display_name}</b>{label} — {q.tx_count} операц.\n{examples}"
         )
         await message.answer(
             text, reply_markup=_question_kb(q.queue_id, keyboards),
@@ -246,6 +280,30 @@ async def cb_transit(query: CallbackQuery) -> None:
         f"{result.affected} операц.)",
         parse_mode="HTML",
     )
+    await query.answer("Запомнил")
+
+
+@dp.callback_query(F.data.startswith("net:"))
+async def cb_netting(query: CallbackQuery) -> None:
+    _, queue_id, rule = query.data.split(":")
+
+    def work():
+        with _session() as session:
+            user = get_or_create_user(
+                session, query.from_user.id,
+                query.from_user.first_name or "без имени",
+            )
+            return apply_netting_answer(session, user, int(queue_id), rule)
+
+    name, collapsed = await _run(work)
+    if rule == "collapse":
+        text = (
+            f"✔ {name}: пары возвратов схлопываю и не считаю "
+            f"(сейчас {collapsed})."
+        )
+    else:
+        text = f"✔ {name}: пары показываю отдельными строками."
+    await query.message.edit_text(text)
     await query.answer("Запомнил")
 
 

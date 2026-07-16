@@ -78,6 +78,8 @@ class QuestionView:
     display_name: str
     examples: list[str]  # готовые строки «14.07 − 1 040,00 ₸»
     tx_count: int
+    direction: str = "all"  # all | in | out
+    qtype: str = "category"  # category | netting
 
 
 @dataclass(frozen=True)
@@ -116,9 +118,22 @@ def _find_counterparty(
 
 
 def _apply_counterparty(tx: Transaction, cp: Counterparty) -> None:
+    """Входящие берут in-разметку, если она задана; иначе основную."""
     tx.counterparty_id = cp.id
-    tx.category_id = cp.category_id
-    tx.ownership = cp.default_ownership
+    if tx.amount > 0 and cp.default_ownership_in is not None:
+        tx.category_id = cp.category_id_in
+        tx.ownership = cp.default_ownership_in
+    else:
+        tx.category_id = cp.category_id
+        tx.ownership = cp.default_ownership
+
+
+def _tx_matches_direction(tx: Transaction, direction: str) -> bool:
+    if direction == "in":
+        return tx.amount > 0
+    if direction == "out":
+        return tx.amount <= 0
+    return True
 
 
 def autocategorize(session: Session, user: User) -> AutoCatResult:
@@ -164,19 +179,60 @@ def autocategorize(session: Session, user: User) -> AutoCatResult:
         session.flush()
         for tx in txs:
             tx.counterparty_id = cp.id
-        session.add(
-            QuestionQueue(
-                user_id=user.id,
-                counterparty_id=cp.id,
-                weight=sum(abs(t.amount) for t in txs) * len(txs),
-                status="pending",
+        # Смешанные знаки — два отдельных вопроса (исходящие и входящие):
+        # у транзитного контрагента входящие могут быть зарплатой.
+        has_out = any(t.amount <= 0 for t in txs)
+        has_in = any(t.amount > 0 for t in txs)
+        directions = ["out", "in"] if (has_out and has_in) else ["all"]
+        for direction in directions:
+            session.add(
+                QuestionQueue(
+                    user_id=user.id,
+                    counterparty_id=cp.id,
+                    weight=0,  # ниже пересчитает _refresh_weights
+                    status="pending",
+                    direction=direction,
+                )
             )
-        )
-        queued += 1
+            queued += 1
 
+    _split_mixed_questions(session, user)
     _refresh_weights(session, user)
     session.commit()
     return AutoCatResult(assigned=assigned, queued=queued)
+
+
+def _split_mixed_questions(session: Session, user: User) -> None:
+    """Old-данные: вопрос direction=all по смешанному контрагенту → out + in."""
+    for q in list(
+        session.scalars(
+            select(QuestionQueue).where(
+                QuestionQueue.user_id == user.id,
+                QuestionQueue.status.in_(("pending", "skipped")),
+                QuestionQueue.qtype == "category",
+                QuestionQueue.direction == "all",
+            )
+        )
+    ):
+        txs = list(
+            session.scalars(
+                select(Transaction).where(
+                    Transaction.user_id == user.id,
+                    Transaction.counterparty_id == q.counterparty_id,
+                )
+            )
+        )
+        if any(t.amount > 0 for t in txs) and any(t.amount <= 0 for t in txs):
+            q.direction = "out"
+            session.add(
+                QuestionQueue(
+                    user_id=user.id,
+                    counterparty_id=q.counterparty_id,
+                    weight=q.weight,
+                    status=q.status,
+                    direction="in",
+                )
+            )
 
 
 def _refresh_weights(session: Session, user: User) -> None:
@@ -186,18 +242,21 @@ def _refresh_weights(session: Session, user: User) -> None:
             select(QuestionQueue).where(
                 QuestionQueue.user_id == user.id,
                 QuestionQueue.status.in_(("pending", "skipped")),
+                QuestionQueue.qtype == "category",
             )
         )
     )
     for q in pending:
-        txs = list(
-            session.scalars(
+        txs = [
+            t
+            for t in session.scalars(
                 select(Transaction).where(
                     Transaction.user_id == user.id,
                     Transaction.counterparty_id == q.counterparty_id,
                 )
             )
-        )
+            if _tx_matches_direction(t, q.direction)
+        ]
         q.weight = sum(abs(t.amount) for t in txs) * len(txs)
 
 
@@ -234,7 +293,7 @@ def next_questions(
     )
     views = []
     for q in rows:
-        txs = list(
+        all_txs = list(
             session.scalars(
                 select(Transaction)
                 .where(
@@ -244,15 +303,30 @@ def next_questions(
                 .order_by(Transaction.date.desc())
             )
         )
+        display = all_txs[0].counterparty_raw if all_txs else "?"
+        if q.qtype == "netting":
+            from finbot.netting import find_pairs
+
+            pairs = find_pairs(all_txs)
+            examples = [
+                f"{p.date:%d.%m} {_fmt_kzt(p.amount)} ↔ "
+                f"{n.date:%d.%m} {_fmt_kzt(n.amount)}"
+                for p, n in pairs[:3]
+            ]
+            count = len(pairs)
+        else:
+            txs = [t for t in all_txs if _tx_matches_direction(t, q.direction)]
+            examples = [f"{t.date:%d.%m} {_fmt_kzt(t.amount)}" for t in txs[:3]]
+            count = len(txs)
         views.append(
             QuestionView(
                 queue_id=q.id,
                 counterparty_id=q.counterparty_id,
-                display_name=txs[0].counterparty_raw if txs else "?",
-                examples=[
-                    f"{t.date:%d.%m} {_fmt_kzt(t.amount)}" for t in txs[:3]
-                ],
-                tx_count=len(txs),
+                display_name=display,
+                examples=examples,
+                tx_count=count,
+                direction=q.direction,
+                qtype=q.qtype,
             )
         )
     return views
@@ -300,7 +374,6 @@ def apply_answer(
 
     if transit:
         category = _category_by_name(session, user, "транзит")
-        cp.default_ownership = "transit"
     elif custom_name is not None:
         category = Category(user_id=user.id, name=custom_name.strip())
         session.add(category)
@@ -310,7 +383,13 @@ def apply_answer(
         if category is None:
             raise ValueError(f"Категория {category_id} не найдена")
 
-    cp.category_id = category.id if category else None
+    ownership = "transit" if transit else "mine"
+    if q.direction == "in":
+        cp.category_id_in = category.id if category else None
+        cp.default_ownership_in = ownership
+    else:
+        cp.category_id = category.id if category else None
+        cp.default_ownership = ownership
     q.status = "answered"
 
     txs = list(
@@ -323,9 +402,10 @@ def apply_answer(
     )
     for tx in txs:
         _apply_counterparty(tx, cp)
+    affected = sum(1 for t in txs if _tx_matches_direction(t, q.direction))
     session.commit()
     return AnswerResult(
         display_name=txs[0].counterparty_raw if txs else cp.name_normalized,
         category_name=category.name if category else "?",
-        affected=len(txs),
+        affected=affected,
     )

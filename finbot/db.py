@@ -20,8 +20,39 @@ def make_session_factory(engine) -> sessionmaker[Session]:
     return sessionmaker(engine, expire_on_commit=False)
 
 
+# Колонки, добавленные после первых релизов: create_all не трогает
+# существующие таблицы, поэтому досоздаём их через ALTER TABLE.
+_MIGRATIONS: dict[str, dict[str, str]] = {
+    "counterparties": {
+        "category_id_in": "INTEGER REFERENCES categories(id)",
+        "default_ownership_in": "VARCHAR(16)",
+    },
+    "question_queue": {
+        "direction": "VARCHAR(3) NOT NULL DEFAULT 'all'",
+        "qtype": "VARCHAR(12) NOT NULL DEFAULT 'category'",
+    },
+}
+
+
+def _migrate(engine) -> None:
+    with engine.begin() as conn:
+        for table, columns in _MIGRATIONS.items():
+            existing = {
+                row[1]
+                for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")
+            }
+            if not existing:  # таблицы ещё нет — её создаст create_all
+                continue
+            for column, ddl in columns.items():
+                if column not in existing:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
+                    )
+
+
 def init_db(engine) -> None:
-    """Создаёт таблицы и досеивает сид-категории (идемпотентно)."""
+    """Создаёт таблицы, мигрирует схему и досеивает сид-категории (идемпотентно)."""
+    _migrate(engine)
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         existing = set(
