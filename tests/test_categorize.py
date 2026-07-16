@@ -11,6 +11,7 @@ from finbot.categorize import (
     normalize_name,
     pending_count,
     seed_category_name,
+    skip_question,
 )
 from finbot.db import init_db, make_engine, make_session_factory
 from finbot.ingest import file_sha256, ingest_statement
@@ -127,6 +128,29 @@ class TestAutocategorize:
         ingest(session, user, [tx(date(2026, 7, 2), -5000)], b"s1")
         autocategorize(session, user)
         assert pending_count(session, other) == 0
+
+
+class TestSkipQuestion:
+    def test_skipped_goes_to_end_but_stays(self, session, user):
+        ingest(session, user, [
+            tx(date(2026, 7, 2), -1500000, cp="Рулан А."),  # тяжёлый, но неудобный
+            tx(date(2026, 7, 3), -5000, cp="M market"),
+        ], b"s1")
+        autocategorize(session, user)
+        top = next_questions(session, user, 5)
+        assert top[0].display_name == "Рулан А."
+
+        skip_question(session, user, top[0].queue_id)
+        reordered = next_questions(session, user, 5)
+        # не исчез, но ушёл в конец, наверх вышел следующий
+        assert [q.display_name for q in reordered] == ["M market", "Рулан А."]
+        assert pending_count(session, user) == 2
+
+        # отложенный всё ещё можно ответить
+        cafe = session.scalar(select(Category).where(Category.name == "кафе и доставка"))
+        result = apply_answer(session, user, top[0].queue_id, category_id=cafe.id)
+        assert result.affected == 1
+        assert pending_count(session, user) == 1
 
 
 class TestApplyAnswer:

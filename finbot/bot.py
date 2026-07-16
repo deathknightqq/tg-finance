@@ -29,6 +29,7 @@ from finbot.categorize import (
     list_categories,
     next_questions,
     pending_count,
+    skip_question,
 )
 from finbot.db import init_db, make_engine, make_session_factory
 from finbot.pipeline import get_or_create_user, process_pdf
@@ -165,6 +166,9 @@ def _question_kb(
             InlineKeyboardButton(text="✏️ своя категория", callback_data=f"cst:{queue_id}"),
         ]
     )
+    rows.append(
+        [InlineKeyboardButton(text="⏭ потом", callback_data=f"skp:{queue_id}")]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -243,6 +247,25 @@ async def cb_transit(query: CallbackQuery) -> None:
         parse_mode="HTML",
     )
     await query.answer("Запомнил")
+
+
+@dp.callback_query(F.data.startswith("skp:"))
+async def cb_skip(query: CallbackQuery) -> None:
+    _, queue_id = query.data.split(":")
+
+    def work():
+        with _session() as session:
+            user = get_or_create_user(
+                session, query.from_user.id,
+                query.from_user.first_name or "без имени",
+            )
+            return skip_question(session, user, int(queue_id))
+
+    name = await _run(work)
+    await query.message.edit_text(
+        f"⏭ {name} — отложил в конец очереди (/unsorted вернёт)."
+    )
+    await query.answer()
 
 
 @dp.callback_query(F.data.startswith("cst:"))

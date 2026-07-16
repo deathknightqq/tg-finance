@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
 from finbot.models import (
@@ -185,7 +185,7 @@ def _refresh_weights(session: Session, user: User) -> None:
         session.scalars(
             select(QuestionQueue).where(
                 QuestionQueue.user_id == user.id,
-                QuestionQueue.status == "pending",
+                QuestionQueue.status.in_(("pending", "skipped")),
             )
         )
     )
@@ -207,7 +207,7 @@ def pending_count(session: Session, user: User) -> int:
             session.scalars(
                 select(QuestionQueue.id).where(
                     QuestionQueue.user_id == user.id,
-                    QuestionQueue.status == "pending",
+                    QuestionQueue.status.in_(("pending", "skipped")),
                 )
             )
         )
@@ -217,15 +217,18 @@ def pending_count(session: Session, user: User) -> int:
 def next_questions(
     session: Session, user: User, limit: int = 5
 ) -> list[QuestionView]:
-    """Топ-N самых весомых вопросов очереди."""
+    """Топ-N вопросов: сначала свежие по весу, отложенные («потом») — в конце."""
     rows = list(
         session.scalars(
             select(QuestionQueue)
             .where(
                 QuestionQueue.user_id == user.id,
-                QuestionQueue.status == "pending",
+                QuestionQueue.status.in_(("pending", "skipped")),
             )
-            .order_by(QuestionQueue.weight.desc())
+            .order_by(
+                case((QuestionQueue.status == "pending", 0), else_=1),
+                QuestionQueue.weight.desc(),
+            )
             .limit(limit)
         )
     )
@@ -264,6 +267,20 @@ def list_categories(session: Session, user: User) -> list[Category]:
             .order_by(Category.id)
         )
     )
+
+
+def skip_question(session: Session, user: User, queue_id: int) -> str:
+    """«Потом»: вопрос уходит в конец очереди, но не исчезает из /unsorted."""
+    q = session.get(QuestionQueue, queue_id)
+    if q is None or q.user_id != user.id:
+        raise ValueError(f"Вопрос {queue_id} не найден")
+    q.status = "skipped"
+    cp = session.get(Counterparty, q.counterparty_id)
+    tx = session.scalar(
+        select(Transaction).where(Transaction.counterparty_id == cp.id).limit(1)
+    )
+    session.commit()
+    return tx.counterparty_raw if tx else cp.name_normalized
 
 
 def apply_answer(
