@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from finbot.categorize import (
     QuestionView,
     apply_answer,
+    autocategorize,
     list_categories,
     next_questions,
     pending_count,
@@ -75,6 +76,9 @@ async def cmd_unsorted(message: Message) -> None:
                 session, message.from_user.id,
                 message.from_user.first_name or "без имени",
             )
+            # доразметка хвостов: транзакции, загруженные до появления
+            # категоризации, попадают в очередь отсюда
+            autocategorize(session, user)
             return next_questions(session, user, BATCH_SIZE), pending_count(
                 session, user
             ), _keyboards(session, user)
