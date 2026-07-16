@@ -212,8 +212,13 @@ def _parse_transactions(pages_lines: list[list[str]]) -> list[ParsedTransaction]
 
 def parse_statement(source: str | Path | IO[bytes]) -> ParsedStatement:
     """PDF → ParsedStatement. Бросает ParseError/GoldenRuleError, мусор не отдаёт."""
-    with pdfplumber.open(source) as pdf:
-        pages_text = [page.extract_text() or "" for page in pdf.pages]
+    try:
+        with pdfplumber.open(source) as pdf:
+            pages_text = [page.extract_text() or "" for page in pdf.pages]
+    except ParseError:
+        raise
+    except Exception as e:  # pdfminer кидает свои исключения на битых файлах
+        raise ParseError(f"Файл не читается как PDF: {e}") from e
 
     full_text = "\n".join(pages_text)
     locale = _detect_locale(full_text)
