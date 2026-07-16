@@ -11,6 +11,7 @@ import io
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from finbot.categorize import autocategorize
 from finbot.ingest import file_sha256, ingest_statement
 from finbot.models import User
 from finbot.parser import (
@@ -55,13 +56,9 @@ def process_pdf(session: Session, tg_id: int, name: str, pdf_bytes: bytes) -> st
     if result.duplicate_file:
         return "Этот файл уже загружали — ничего не добавил."
 
+    cat = autocategorize(session, user)
+
     h = parsed.header
-    unknown = len(
-        {
-            tx.counterparty_raw
-            for tx in parsed.transactions
-        }
-    )
     lines = [
         f"✅ Выписка за {h.period_start:%d.%m.%y} – {h.period_end:%d.%m.%y} разобрана, "
         f"баланс сошёлся ({_fmt_kzt(h.opening_balance)} → {_fmt_kzt(h.closing_balance)}).",
@@ -72,8 +69,8 @@ def process_pdf(session: Session, tg_id: int, name: str, pdf_bytes: bytes) -> st
             f"Пропущено дублей (перекрытие с прошлыми выписками): "
             f"{result.duplicates_skipped}"
         )
-    lines.append(
-        f"Неизвестных контрагентов: {unknown} — опросник по категориям "
-        "появится в следующем чанке."
-    )
+    if cat.assigned:
+        lines.append(f"Разметил по правилам и словарю: {cat.assigned}")
+    if cat.queued:
+        lines.append(f"Нашёл {cat.queued} неизвестных контрагентов.")
     return "\n".join(lines)
