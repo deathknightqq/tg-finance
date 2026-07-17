@@ -9,6 +9,7 @@ import asyncio
 import io
 import logging
 import os
+from datetime import date, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -34,6 +35,15 @@ from finbot.categorize import (
 from finbot.db import init_db, make_engine, make_session_factory
 from finbot.netting import apply_netting_answer, scan_pairs
 from finbot.pipeline import get_or_create_user, process_pdf
+from finbot.reports import (
+    _fmt_kzt as _fmt,
+    build_report,
+    find_regular_payments,
+    format_report,
+    free_until_month_end,
+    month_bounds,
+    set_budget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +74,79 @@ async def cmd_start(message: Message) -> None:
     await message.answer(
         "Привет! Я считаю личные финансы по выпискам Kaspi Gold.\n\n"
         "Пришли мне PDF-выписку (Kaspi → Карта → Выписка), и я разберу операции. "
-        "Про незнакомых контрагентов задам несколько вопросов — так я учусь. "
-        "Очередь вопросов всегда доступна через /unsorted.\n\n"
+        "Про незнакомых контрагентов задам несколько вопросов — так я учусь.\n\n"
+        "Команды:\n"
+        "/report — отчёт за месяц (/report неделя — за 7 дней)\n"
+        "/budget 300000 — бюджет месяца и «свободно до конца месяца»\n"
+        "/unsorted — очередь вопросов по контрагентам\n\n"
         "Сырой PDF после разбора не хранится, персональные данные не сохраняются."
     )
+
+
+@dp.message(Command("report"))
+async def cmd_report(message: Message) -> None:
+    arg = (message.text or "").split(maxsplit=1)
+    weekly = len(arg) > 1 and arg[1].strip().lower().startswith("нед")
+
+    def work():
+        with _session() as session:
+            user = get_or_create_user(
+                session, message.from_user.id,
+                message.from_user.first_name or "без имени",
+            )
+            today = date.today()
+            if weekly:
+                start, end = today - timedelta(days=6), today
+                title = "Отчёт за неделю"
+                budget_line = None
+            else:
+                start, end = month_bounds(today)
+                title = f"Отчёт за {today:%m.%Y}"
+                budget_line = free_until_month_end(session, user, today)
+            data = build_report(session, user, start, end)
+            regular = None if weekly else find_regular_payments(session, user)
+            return format_report(
+                data, title=title, budget_line=budget_line, regular=regular
+            )
+
+    await message.answer(await _run(work), parse_mode="HTML")
+
+
+@dp.message(Command("budget"))
+async def cmd_budget(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+
+    def work():
+        with _session() as session:
+            user = get_or_create_user(
+                session, message.from_user.id,
+                message.from_user.first_name or "без имени",
+            )
+            today = date.today()
+            if len(parts) > 1:
+                raw = parts[1].strip().replace(" ", "").replace("₸", "")
+                try:
+                    amount_kzt = int(raw)
+                except ValueError:
+                    return (
+                        "Не понял сумму. Пример: /budget 300000 — бюджет "
+                        "на текущий месяц в тенге."
+                    )
+                set_budget(session, user, f"{today:%Y-%m}", amount_kzt * 100)
+            line = free_until_month_end(session, user, today)
+            if line is None:
+                return (
+                    "Бюджет на этот месяц не задан. Задать: /budget 300000 "
+                    "(сумма в тенге)."
+                )
+            budget, spent, free = line
+            return (
+                f"💰 Бюджет {today:%m.%Y}: {_fmt(budget)}\n"
+                f"Потрачено (моё): {_fmt(spent)}\n"
+                f"Свободно до конца месяца: {_fmt(free)}"
+            )
+
+    await message.answer(await _run(work))
 
 
 @dp.message(Command("unsorted"))
