@@ -148,6 +148,7 @@ def autocategorize(session: Session, user: User) -> AutoCatResult:
     )
     assigned = 0
     unknown: dict[str, list[Transaction]] = {}
+    reask: set[tuple[int, str]] = set()
     for tx in todo:
         name = normalize_name(tx.counterparty_raw)
         cp = _find_counterparty(session, user, name)
@@ -165,10 +166,35 @@ def autocategorize(session: Session, user: User) -> AutoCatResult:
                 session.flush()
         if cp is not None:
             _apply_counterparty(tx, cp)
-            if cp.category_id is not None:
+            if tx.category_id is not None:
                 assigned += 1
+            elif tx.ownership == "mine":
+                # известный контрагент, но для этого направления разметки
+                # нет (отвечали только про другое) — вопрос заново
+                reask.add((cp.id, "in" if tx.amount > 0 else "out"))
             continue
         unknown.setdefault(name, []).append(tx)
+
+    for cp_id, direction in reask:
+        exists = session.scalar(
+            select(QuestionQueue.id).where(
+                QuestionQueue.user_id == user.id,
+                QuestionQueue.counterparty_id == cp_id,
+                QuestionQueue.qtype == "category",
+                QuestionQueue.status.in_(("pending", "skipped")),
+                QuestionQueue.direction.in_((direction, "all")),
+            )
+        )
+        if exists is None:
+            session.add(
+                QuestionQueue(
+                    user_id=user.id,
+                    counterparty_id=cp_id,
+                    weight=0,
+                    status="pending",
+                    direction=direction,
+                )
+            )
 
     queued = 0
     for name, txs in unknown.items():
@@ -179,11 +205,7 @@ def autocategorize(session: Session, user: User) -> AutoCatResult:
         session.flush()
         for tx in txs:
             tx.counterparty_id = cp.id
-        # Смешанные знаки — два отдельных вопроса (исходящие и входящие):
-        # у транзитного контрагента входящие могут быть зарплатой.
-        has_out = any(t.amount <= 0 for t in txs)
-        has_in = any(t.amount > 0 for t in txs)
-        directions = ["out", "in"] if (has_out and has_in) else ["all"]
+        directions = _question_directions(txs)
         for direction in directions:
             session.add(
                 QuestionQueue(
@@ -200,6 +222,28 @@ def autocategorize(session: Session, user: User) -> AutoCatResult:
     _refresh_weights(session, user)
     session.commit()
     return AutoCatResult(assigned=assigned, queued=queued)
+
+
+_PERSON_OPS = ("transfer", "topup")
+
+
+def _question_directions(txs: list[Transaction]) -> list[str]:
+    """Какие вопросы задавать по контрагенту.
+
+    Делим на входящие/исходящие только «людские» плюсы (переводы/пополнения):
+    у транзитного контрагента входящие могут быть зарплатой. Плюс с типом
+    «покупка» — это возврат: отдельный вопрос не нужен, он наследует
+    категорию контрагента (отчёт вычтет его из категории сам).
+    """
+    has_out = any(t.amount <= 0 for t in txs)
+    person_in = any(
+        t.amount > 0 and t.op_type in _PERSON_OPS for t in txs
+    )
+    if has_out and person_in:
+        return ["out", "in"]
+    if not has_out and any(t.amount > 0 for t in txs):
+        return ["in"]  # чисто входящий контрагент — компактная клавиатура
+    return ["all"]
 
 
 def _split_mixed_questions(session: Session, user: User) -> None:
@@ -222,7 +266,7 @@ def _split_mixed_questions(session: Session, user: User) -> None:
                 )
             )
         )
-        if any(t.amount > 0 for t in txs) and any(t.amount <= 0 for t in txs):
+        if _question_directions(txs) == ["out", "in"]:
             q.direction = "out"
             session.add(
                 QuestionQueue(

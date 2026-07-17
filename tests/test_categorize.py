@@ -153,6 +153,30 @@ class TestSkipQuestion:
         assert pending_count(session, user) == 1
 
 
+class TestReaskOtherDirection:
+    def test_answered_in_then_new_outgoing_asks_again(self, session, user):
+        """Ответили про входящие; появились исходящие — новый вопрос, не дыра."""
+        ingest(session, user, [
+            tx(date(2026, 7, 2), 500000, op_type="topup", cp="Эльдар А."),
+        ], b"s1")
+        autocategorize(session, user)
+        q = next_questions(session, user, 5)[0]
+        assert q.direction == "in"
+        income = session.scalar(select(Category).where(Category.name == "доход"))
+        apply_answer(session, user, q.queue_id, category_id=income.id)
+        assert pending_count(session, user) == 0
+
+        ingest(session, user, [
+            tx(date(2026, 8, 3), -300000, op_type="transfer", cp="Эльдар А."),
+        ], b"s2", date(2026, 8, 1), date(2026, 8, 31))
+        autocategorize(session, user)
+        qs = next_questions(session, user, 5)
+        assert len(qs) == 1 and qs[0].direction == "out"
+        # повторный прогон не плодит дубль
+        autocategorize(session, user)
+        assert pending_count(session, user) == 1
+
+
 class TestApplyAnswer:
     def test_category_answer_applies_to_all(self, session, user):
         ingest(session, user, [

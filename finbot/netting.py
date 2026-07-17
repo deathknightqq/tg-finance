@@ -17,7 +17,18 @@ from sqlalchemy.orm import Session
 
 from finbot.models import Counterparty, QuestionQueue, Transaction, User
 
-PAIR_WINDOW_DAYS = 2
+# Окна подобраны по реальным кейсам (шире спековых ±2 дней — фидбек юзера):
+# возврат за покупку приходит в течение недели, долги между людьми
+# возвращают и через несколько недель.
+PURCHASE_WINDOW_DAYS = 7
+PERSON_WINDOW_DAYS = 30
+_PERSON_OPS = ("transfer", "topup")
+
+
+def _pair_window(a: Transaction, b: Transaction) -> int:
+    if a.op_type in _PERSON_OPS and b.op_type in _PERSON_OPS:
+        return PERSON_WINDOW_DAYS
+    return PURCHASE_WINDOW_DAYS
 
 
 @dataclass(frozen=True)
@@ -41,7 +52,7 @@ def find_pairs(txs: list[Transaction]) -> list[tuple[Transaction, Transaction]]:
             for n in neg:
                 if id(n) in used:
                     continue
-                if abs((p.date - n.date).days) <= PAIR_WINDOW_DAYS:
+                if abs((p.date - n.date).days) <= _pair_window(p, n):
                     pairs.append((p, n))
                     used.add(id(n))
                     break

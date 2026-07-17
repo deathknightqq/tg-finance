@@ -82,7 +82,15 @@ def _visible_txs(session: Session, user: User, start: date, end: date):
 def build_report(
     session: Session, user: User, start: date, end: date
 ) -> ReportData:
-    by_cat: dict[int | None, int] = defaultdict(int)
+    names = {
+        c.id: c.name
+        for c in session.scalars(
+            select(Category).where(
+                (Category.user_id.is_(None)) | (Category.user_id == user.id)
+            )
+        )
+    }
+    by_cat: dict[int, int] = defaultdict(int)
     uncategorized = 0
     unassigned = 0
     income = 0
@@ -91,22 +99,28 @@ def build_report(
             if t.amount < 0:
                 unassigned += t.amount
             continue
+        is_income_cat = (
+            t.category_id is None or names.get(t.category_id) == "доход"
+        )
         if t.amount > 0:
-            income += t.amount
+            if is_income_cat:
+                income += t.amount
+            else:
+                # возврат на расходного контрагента (частичный в т.ч.):
+                # уменьшает категорию, а не раздувает «доходы»
+                by_cat[t.category_id] += t.amount
             continue
-        if t.category_id is None:
+        if t.category_id is None or names.get(t.category_id) == "доход":
             uncategorized += t.amount
         else:
             by_cat[t.category_id] += t.amount
 
-    names = {
-        c.id: c.name
-        for c in session.scalars(
-            select(Category).where(Category.id.in_(by_cat.keys()))
-        )
-    }
     expenses = sorted(
-        ((names.get(cid, "?"), total) for cid, total in by_cat.items()),
+        (
+            (names.get(cid, "?"), total)
+            for cid, total in by_cat.items()
+            if total != 0  # категория, полностью погашенная возвратами
+        ),
         key=lambda pair: pair[1],
     )
     return ReportData(
@@ -142,11 +156,8 @@ def free_until_month_end(
     if budget is None:
         return None
     start, end = month_bounds(today)
-    spent = -sum(
-        t.amount
-        for t in _visible_txs(session, user, start, end)
-        if t.ownership == "mine" and t.amount < 0
-    )
+    # возвраты уменьшают «потрачено» так же, как в отчёте
+    spent = -build_report(session, user, start, end).total_expenses
     return budget, spent, budget - spent
 
 

@@ -82,7 +82,32 @@ class TestFindPairs:
     def test_no_pair_outside_window(self, session, user):
         ingest(session, user, [
             tx(date(2026, 7, 14), 180000),
-            tx(date(2026, 7, 10), -180000),  # 4 дня — не пара
+            tx(date(2026, 7, 2), -180000),  # 12 дней для покупки — не пара
+        ])
+        autocategorize(session, user)
+        assert find_pairs(list(session.scalars(select(Transaction)))) == []
+
+    def test_purchase_refund_within_week(self, session, user):
+        ingest(session, user, [
+            tx(date(2026, 7, 14), 180000),
+            tx(date(2026, 7, 9), -180000),  # 5 дней — возврат покупки, пара
+        ])
+        autocategorize(session, user)
+        assert len(find_pairs(list(session.scalars(select(Transaction))))) == 1
+
+    def test_debt_return_week_later(self, session, user):
+        """Еркебулан закинул +2000, через неделю вернул −2000 — это пара."""
+        ingest(session, user, [
+            tx(date(2026, 6, 14), 200000, op_type="topup", cp="Еркебұлан Б."),
+            tx(date(2026, 6, 21), -200000, op_type="transfer", cp="Еркебұлан Б."),
+        ])
+        autocategorize(session, user)
+        assert len(find_pairs(list(session.scalars(select(Transaction))))) == 1
+
+    def test_person_transfers_not_paired_beyond_month(self, session, user):
+        ingest(session, user, [
+            tx(date(2026, 6, 1), 200000, op_type="topup", cp="Еркебұлан Б."),
+            tx(date(2026, 7, 15), -200000, op_type="transfer", cp="Еркебұлан Б."),
         ])
         autocategorize(session, user)
         assert find_pairs(list(session.scalars(select(Transaction)))) == []
@@ -155,8 +180,8 @@ class TestMixedDirections:
     def test_mixed_counterparty_two_questions(self, session, user):
         """Олжас: −919к транзит, +91к зарплата — размечаются раздельно."""
         ingest(session, user, [
-            tx(date(2026, 7, 2), -91900000, cp="Олжас Б."),
-            tx(date(2026, 6, 24), 9100000, cp="Олжас Б."),
+            tx(date(2026, 7, 2), -91900000, op_type="transfer", cp="Олжас Б."),
+            tx(date(2026, 6, 24), 9100000, op_type="topup", cp="Олжас Б."),
         ])
         autocategorize(session, user)
         qs = [v for v in next_questions(session, user, 10) if v.qtype == "category"]

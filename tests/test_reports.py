@@ -6,7 +6,11 @@ from sqlalchemy import select
 from finbot.db import init_db, make_engine, make_session_factory
 from finbot.ingest import file_sha256, ingest_statement
 from finbot.models import Category, Transaction, User
-from finbot.categorize import autocategorize, apply_answer, next_questions
+from finbot.categorize import (
+    apply_answer,
+    autocategorize,
+    next_questions,
+)
 from finbot.netting import apply_netting_answer, scan_pairs
 from finbot.parser import ParsedStatement, ParsedTransaction, StatementHeader
 from finbot.reports import (
@@ -104,6 +108,39 @@ class TestBuildReport:
         data = build_report(session, user, date(2026, 7, 1), date(2026, 7, 31))
         text = format_report(data, title="Отчёт")
         assert "транспорт" in text and "110 ₸" in text
+
+
+class TestPartialRefund:
+    def test_refund_reduces_category_not_income(self, session, user):
+        """Смолл: купил на 40 000, возврат 4 000 — категория нетто −36 000."""
+        ingest(session, user, [
+            tx(date(2026, 7, 3), -4000000, cp="SMALL"),
+            tx(date(2026, 7, 5), 400000, cp="SMALL"),
+        ])
+        autocategorize(session, user)
+        qs = next_questions(session, user, 10)
+        # возврат покупки не порождает отдельного вопроса про «входящие»
+        assert len(qs) == 1 and qs[0].direction == "all"
+        prod = session.scalar(select(Category).where(Category.name == "продукты"))
+        apply_answer(session, user, qs[0].queue_id, category_id=prod.id)
+        data = build_report(session, user, date(2026, 7, 1), date(2026, 7, 31))
+        assert dict(data.expenses_by_category) == {"продукты": -3600000}
+        assert data.income == 0
+        assert data.total_expenses == -3600000
+
+    def test_refund_reduces_budget_spent(self, session, user):
+        ingest(session, user, [
+            tx(date(2026, 7, 3), -4000000, cp="SMALL"),
+            tx(date(2026, 7, 5), 400000, cp="SMALL"),
+        ])
+        autocategorize(session, user)
+        prod = session.scalar(select(Category).where(Category.name == "продукты"))
+        q = next_questions(session, user, 10)[0]
+        apply_answer(session, user, q.queue_id, category_id=prod.id)
+        set_budget(session, user, "2026-07", 10000000)
+        _, spent, free = free_until_month_end(session, user, date(2026, 7, 17))
+        assert spent == 3600000
+        assert free == 6400000
 
 
 class TestBudget:
