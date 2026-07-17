@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from sqlalchemy import case, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from finbot.models import (
@@ -343,11 +343,48 @@ def list_categories(session: Session, user: User) -> list[Category]:
     )
 
 
+# Для входящих денег расходные категории — шум; оставляем осмысленное.
+_IN_SEED_CATEGORIES = ("доход", "семья", "наличка", "прочее")
+
+
+def categories_for_question(
+    session: Session, user: User, direction: str
+) -> list[tuple[int, str]]:
+    """(id, name) для клавиатуры вопроса: по направлению, частые — первыми.
+
+    «транзит» не включается — у него своя кнопка. Свои категории юзера
+    показываются всегда.
+    """
+    cats = list_categories(session, user)
+    usage: dict[int, int] = dict(
+        session.execute(
+            select(Transaction.category_id, func.count())
+            .where(
+                Transaction.user_id == user.id,
+                Transaction.category_id.is_not(None),
+            )
+            .group_by(Transaction.category_id)
+        ).all()
+    )
+    if direction == "in":
+        pool = [
+            c
+            for c in cats
+            if c.user_id == user.id or c.name in _IN_SEED_CATEGORIES
+        ]
+    else:
+        pool = [c for c in cats if c.name not in ("доход", "транзит")]
+    pool.sort(key=lambda c: -usage.get(c.id, 0))  # sort стабилен: при равенстве
+    return [(c.id, c.name) for c in pool]  # сохраняется сид-порядок
+
+
 def skip_question(session: Session, user: User, queue_id: int) -> str:
     """«Потом»: вопрос уходит в конец очереди, но не исчезает из /unsorted."""
     q = session.get(QuestionQueue, queue_id)
     if q is None or q.user_id != user.id:
         raise ValueError(f"Вопрос {queue_id} не найден")
+    if q.status == "answered":
+        raise ValueError(f"Вопрос {queue_id} уже отвечен")
     q.status = "skipped"
     cp = session.get(Counterparty, q.counterparty_id)
     tx = session.scalar(

@@ -124,6 +124,42 @@ class Budget(Base):
     amount: Mapped[int]  # тиыны
 
 
+class Invite(Base):
+    """Инвайт-код для связки пары."""
+
+    __tablename__ = "invites"
+
+    code: Mapped[str] = mapped_column(String(8), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(
+        default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class CategoryShare(Base):
+    """Какие категории юзер расшарил партнёру (выборочный шаринг)."""
+
+    __tablename__ = "category_shares"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    category_id: Mapped[int] = mapped_column(
+        ForeignKey("categories.id"), primary_key=True
+    )
+
+
+class MatchDecline(Base):
+    """Пара транзакций, про которую юзер сказал «не внутрисемейное» — не переспрашивать."""
+
+    __tablename__ = "match_declines"
+
+    tx_id: Mapped[int] = mapped_column(
+        ForeignKey("transactions.id"), primary_key=True
+    )
+    other_tx_id: Mapped[int] = mapped_column(
+        ForeignKey("transactions.id"), primary_key=True
+    )
+
+
 class QuestionQueue(Base):
     __tablename__ = "question_queue"
 

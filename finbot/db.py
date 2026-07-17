@@ -13,7 +13,12 @@ DEFAULT_URL = "sqlite:///finbot.db"
 
 
 def make_engine(url: str | None = None):
-    return create_engine(url or os.getenv("DATABASE_URL", DEFAULT_URL))
+    url = url or os.getenv("DATABASE_URL", DEFAULT_URL)
+    kwargs = {}
+    if url.startswith("sqlite"):
+        # два юзера могут жать кнопки одновременно — ждём блокировку, не падаем
+        kwargs["connect_args"] = {"timeout": 30}
+    return create_engine(url, **kwargs)
 
 
 def make_session_factory(engine) -> sessionmaker[Session]:

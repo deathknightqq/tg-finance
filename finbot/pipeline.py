@@ -11,7 +11,7 @@ import io
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from finbot.categorize import autocategorize
+from finbot.categorize import autocategorize, pending_count
 from finbot.ingest import file_sha256, ingest_statement
 from finbot.netting import scan_pairs
 from finbot.models import User
@@ -55,7 +55,13 @@ def process_pdf(session: Session, tg_id: int, name: str, pdf_bytes: bytes) -> st
 
     result = ingest_statement(session, user, parsed, file_sha256(pdf_bytes))
     if result.duplicate_file:
-        return "Этот файл уже загружали — ничего не добавил."
+        # хвосты всё равно доразмечаем — вдруг очередь пополнилась логикой,
+        # которой не было при первой загрузке
+        autocategorize(session, user)
+        scan_pairs(session, user)
+        left = pending_count(session, user)
+        tail = f" В очереди {left} вопросов — /unsorted." if left else ""
+        return f"Этот файл уже загружали — новых операций нет.{tail}"
 
     cat = autocategorize(session, user)
     net = scan_pairs(session, user)

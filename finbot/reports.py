@@ -18,7 +18,28 @@ from datetime import date, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from finbot.models import Budget, Category, Transaction, User
+from sqlalchemy import func
+
+from finbot.models import Budget, Category, Statement, Transaction, User
+
+
+def data_coverage(session: Session, user: User) -> date | None:
+    """До какой даты у юзера вообще есть данные (конец последней выписки)."""
+    return session.scalar(
+        select(func.max(Statement.period_end)).where(Statement.user_id == user.id)
+    )
+
+
+def freshness_note(session: Session, user: User, today: date) -> str | None:
+    cov = data_coverage(session, user)
+    if cov is None:
+        return "📄 Данных пока нет — пришли PDF-выписку Kaspi Gold."
+    if cov < today:
+        return (
+            f"📄 Данные по {cov:%d.%m.%y}. Чтобы актуализировать, пришли "
+            f"выписку за период с {cov:%d.%m.%y} по сегодня."
+        )
+    return None
 
 
 def _fmt_kzt(tiyn: int) -> str:

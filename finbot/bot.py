@@ -1,4 +1,4 @@
-"""Бот: /start, приём PDF, опросник категорий пачками по 5, /unsorted.
+"""Бот FinBot: приём выписок, опросник, отчёты, бюджет, пара.
 
 Запуск: python -m finbot.bot (long polling, без вебхуков).
 """
@@ -16,10 +16,13 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 from dotenv import load_dotenv
 
@@ -27,10 +30,22 @@ from finbot.categorize import (
     QuestionView,
     apply_answer,
     autocategorize,
+    categories_for_question,
     list_categories,
     next_questions,
     pending_count,
     skip_question,
+)
+from finbot.couple import (
+    CoupleError,
+    confirm_match,
+    create_invite,
+    join_couple,
+    match_mutual_transfers,
+    partner_of,
+    partner_shared_totals,
+    shared_category_ids,
+    toggle_share,
 )
 from finbot.db import init_db, make_engine, make_session_factory
 from finbot.netting import apply_netting_answer, scan_pairs
@@ -41,6 +56,7 @@ from finbot.reports import (
     find_regular_payments,
     format_report,
     free_until_month_end,
+    freshness_note,
     month_bounds,
     set_budget,
 )
@@ -49,6 +65,20 @@ logger = logging.getLogger(__name__)
 
 MAX_PDF_BYTES = 20 * 1024 * 1024  # лимит Bot API на скачивание файла
 BATCH_SIZE = 5
+
+BTN_REPORT = "📊 Отчёт"
+BTN_WEEK = "📅 Неделя"
+BTN_QUEUE = "❓ Вопросы"
+BTN_BUDGET = "💰 Бюджет"
+
+MENU_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_REPORT), KeyboardButton(text=BTN_WEEK)],
+        [KeyboardButton(text=BTN_QUEUE), KeyboardButton(text=BTN_BUDGET)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 dp = Dispatcher()
 
@@ -66,6 +96,11 @@ async def _run(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+def _user_of(msg_or_query, session):
+    fu = msg_or_query.from_user
+    return get_or_create_user(session, fu.id, fu.first_name or "без имени")
+
+
 # --- команды -----------------------------------------------------------------
 
 
@@ -76,40 +111,63 @@ async def cmd_start(message: Message) -> None:
         "Пришли мне PDF-выписку (Kaspi → Карта → Выписка), и я разберу операции. "
         "Про незнакомых контрагентов задам несколько вопросов — так я учусь.\n\n"
         "Команды:\n"
-        "/report — отчёт за месяц (/report неделя — за 7 дней)\n"
+        "/report — отчёт за месяц (/report неделя, /report общий)\n"
         "/budget 300000 — бюджет месяца и «свободно до конца месяца»\n"
-        "/unsorted — очередь вопросов по контрагентам\n\n"
-        "Сырой PDF после разбора не хранится, персональные данные не сохраняются."
+        "/unsorted — очередь вопросов по контрагентам\n"
+        "/invite — код для связки с партнёром, /join КОД — ввести код\n"
+        "/share — какие категории видит партнёр\n\n"
+        "Сырой PDF после разбора не хранится, персональные данные не сохраняются.",
+        reply_markup=MENU_KB,
     )
+
+
+async def _do_report(message: Message, mode: str) -> None:
+    def work():
+        with _session() as session:
+            user = _user_of(message, session)
+            today = date.today()
+            if mode == "week":
+                start, end = today - timedelta(days=6), today
+                data = build_report(session, user, start, end)
+                text = format_report(data, title="Отчёт за неделю")
+            else:
+                start, end = month_bounds(today)
+                data = build_report(session, user, start, end)
+                text = format_report(
+                    data,
+                    title=f"Отчёт за {today:%m.%Y}",
+                    budget_line=free_until_month_end(session, user, today),
+                    regular=find_regular_payments(session, user),
+                )
+                if mode == "joint":
+                    shared = partner_shared_totals(session, user, start, end)
+                    if shared is None:
+                        text += "\n\n👥 Пара не настроена: /invite или /join КОД."
+                    elif not shared:
+                        text += "\n\n👥 Партнёр пока ничего не расшарил."
+                    else:
+                        text += "\n\n👥 Партнёр (расшаренные категории):"
+                        for name, total in shared:
+                            text += f"\n  {name}: {_fmt(total)}"
+            note = freshness_note(session, user, today)
+            if note:
+                text += f"\n\n{note}"
+            return text
+
+    await message.answer(await _run(work), parse_mode="HTML")
 
 
 @dp.message(Command("report"))
 async def cmd_report(message: Message) -> None:
     arg = (message.text or "").split(maxsplit=1)
-    weekly = len(arg) > 1 and arg[1].strip().lower().startswith("нед")
-
-    def work():
-        with _session() as session:
-            user = get_or_create_user(
-                session, message.from_user.id,
-                message.from_user.first_name or "без имени",
-            )
-            today = date.today()
-            if weekly:
-                start, end = today - timedelta(days=6), today
-                title = "Отчёт за неделю"
-                budget_line = None
-            else:
-                start, end = month_bounds(today)
-                title = f"Отчёт за {today:%m.%Y}"
-                budget_line = free_until_month_end(session, user, today)
-            data = build_report(session, user, start, end)
-            regular = None if weekly else find_regular_payments(session, user)
-            return format_report(
-                data, title=title, budget_line=budget_line, regular=regular
-            )
-
-    await message.answer(await _run(work), parse_mode="HTML")
+    mode = "month"
+    if len(arg) > 1:
+        word = arg[1].strip().lower()
+        if word.startswith("нед"):
+            mode = "week"
+        elif word.startswith(("общ", "пар", "сов")):
+            mode = "joint"
+    await _do_report(message, mode)
 
 
 @dp.message(Command("budget"))
@@ -118,10 +176,7 @@ async def cmd_budget(message: Message) -> None:
 
     def work():
         with _session() as session:
-            user = get_or_create_user(
-                session, message.from_user.id,
-                message.from_user.first_name or "без имени",
-            )
+            user = _user_of(message, session)
             today = date.today()
             if len(parts) > 1:
                 raw = parts[1].strip().replace(" ", "").replace("₸", "")
@@ -153,23 +208,137 @@ async def cmd_budget(message: Message) -> None:
 async def cmd_unsorted(message: Message) -> None:
     def work():
         with _session() as session:
-            user = get_or_create_user(
-                session, message.from_user.id,
-                message.from_user.first_name or "без имени",
-            )
+            user = _user_of(message, session)
             # доразметка хвостов: транзакции, загруженные до появления
             # категоризации/неттинга, попадают в очередь отсюда
             autocategorize(session, user)
             scan_pairs(session, user)
-            return next_questions(session, user, BATCH_SIZE), pending_count(
-                session, user
-            ), _keyboards(session, user)
+            return (
+                next_questions(session, user, BATCH_SIZE),
+                pending_count(session, user),
+                _keyboards(session, user),
+            )
 
     questions, total, keyboards = await _run(work)
     if not questions:
         await message.answer("Очередь пуста — все контрагенты разобраны 🎉")
         return
     await _send_batch(message, questions, total, keyboards)
+
+
+# --- пара ---------------------------------------------------------------------
+
+
+@dp.message(Command("invite"))
+async def cmd_invite(message: Message) -> None:
+    def work():
+        with _session() as session:
+            user = _user_of(message, session)
+            try:
+                code = create_invite(session, user)
+            except CoupleError as e:
+                return str(e)
+            return (
+                f"Код для партнёра: <code>{code}</code>\n"
+                f"Партнёр вводит у меня: /join {code}"
+            )
+
+    await message.answer(await _run(work), parse_mode="HTML")
+
+
+@dp.message(Command("join"))
+async def cmd_join(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Формат: /join КОД (код даёт /invite у партнёра).")
+        return
+
+    def work():
+        with _session() as session:
+            user = _user_of(message, session)
+            try:
+                partner = join_couple(session, user, parts[1])
+            except CoupleError as e:
+                return str(e)
+            return (
+                f"Связал с партнёром: {partner.name} 👥\n"
+                "Что партнёр видит, настраивается через /share "
+                "(по умолчанию — ничего)."
+            )
+
+    await message.answer(await _run(work))
+
+
+def _share_kb(session, user) -> InlineKeyboardMarkup:
+    shared = shared_category_ids(session, user)
+    rows = []
+    for c in list_categories(session, user):
+        mark = "✅" if c.id in shared else "🔒"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{mark} {c.name}", callback_data=f"shr:{c.id}"
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("share"))
+async def cmd_share(message: Message) -> None:
+    def work():
+        with _session() as session:
+            user = _user_of(message, session)
+            if partner_of(session, user) is None:
+                return None
+            return _share_kb(session, user)
+
+    kb = await _run(work)
+    if kb is None:
+        await message.answer("Сначала свяжись с партнёром: /invite или /join КОД.")
+        return
+    await message.answer(
+        "Что видит партнёр (✅ — видит итоги и операции категории, 🔒 — нет):",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("shr:"))
+async def cb_share(query: CallbackQuery) -> None:
+    _, cat_id = query.data.split(":")
+
+    def work():
+        with _session() as session:
+            user = _user_of(query, session)
+            toggle_share(session, user, int(cat_id))
+            return _share_kb(session, user)
+
+    kb = await _run(work)
+    await query.message.edit_reply_markup(reply_markup=kb)
+    await query.answer()
+
+
+# --- кнопки меню (регистрируются до FSM-хендлера свободного текста) ------------
+
+
+@dp.message(F.text == BTN_REPORT)
+async def btn_report(message: Message) -> None:
+    await _do_report(message, "month")
+
+
+@dp.message(F.text == BTN_WEEK)
+async def btn_week(message: Message) -> None:
+    await _do_report(message, "week")
+
+
+@dp.message(F.text == BTN_QUEUE)
+async def btn_queue(message: Message) -> None:
+    await cmd_unsorted(message)
+
+
+@dp.message(F.text == BTN_BUDGET)
+async def btn_budget(message: Message) -> None:
+    await cmd_budget(message)
 
 
 # --- приём PDF ---------------------------------------------------------------
@@ -195,20 +364,25 @@ async def on_document(message: Message, bot: Bot) -> None:
 
     def work():
         with _session() as session:
-            user = get_or_create_user(
-                session, message.from_user.id,
-                message.from_user.first_name or "без имени",
-            )
+            user = _user_of(message, session)
             reply = process_pdf(
-                session, message.from_user.id,
-                message.from_user.first_name or "без имени", pdf_bytes,
+                session, user.tg_id, user.name, pdf_bytes,
             )
-            return reply, next_questions(session, user, BATCH_SIZE), pending_count(
-                session, user
-            ), _keyboards(session, user)
+            match = match_mutual_transfers(session, user)
+            return (
+                reply,
+                match,
+                next_questions(session, user, BATCH_SIZE),
+                pending_count(session, user),
+                _keyboards(session, user),
+            )
 
-    reply, questions, total, keyboards = await _run(work)
+    reply, match, questions, total, keyboards = await _run(work)
+    if match.auto_matched:
+        reply += f"\nВзаимных переводов пары схлопнуто: {match.auto_matched}"
     await message.answer(reply)
+    for cand in match.candidates:
+        await _send_match_card(message, cand)
     if questions:
         await message.answer(
             f"Спрошу про {min(BATCH_SIZE, total)} самых весомых из {total}:"
@@ -219,9 +393,13 @@ async def on_document(message: Message, bot: Bot) -> None:
 # --- опросник ----------------------------------------------------------------
 
 
-def _keyboards(session, user) -> list[tuple[int, str]]:
-    """(id, name) категорий для клавиатуры — считается внутри сессии."""
-    return [(c.id, c.name) for c in list_categories(session, user)]
+def _keyboards(session, user) -> dict[str, list[tuple[int, str]]]:
+    """Наборы категорий для карточек: отдельно для входящих и исходящих."""
+    return {
+        "in": categories_for_question(session, user, "in"),
+        "out": categories_for_question(session, user, "out"),
+        "all": categories_for_question(session, user, "all"),
+    }
 
 
 def _question_kb(
@@ -229,8 +407,6 @@ def _question_kb(
 ) -> InlineKeyboardMarkup:
     rows, row = [], []
     for cat_id, name in categories:
-        if name == "транзит":
-            continue  # транзит — отдельная кнопка ниже
         row.append(
             InlineKeyboardButton(
                 text=name, callback_data=f"ans:{queue_id}:{cat_id}"
@@ -253,20 +429,6 @@ def _question_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _batch_footer_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="ещё 5", callback_data="more"),
-                InlineKeyboardButton(text="хватит, потом", callback_data="stop"),
-            ]
-        ]
-    )
-
-
-_DIRECTION_LABEL = {"in": " (входящие ➕)", "out": " (исходящие ➖)", "all": ""}
-
-
 def _netting_kb(queue_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -285,11 +447,48 @@ def _netting_kb(queue_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def _batch_footer_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="ещё 5", callback_data="more"),
+                InlineKeyboardButton(text="хватит, потом", callback_data="stop"),
+            ]
+        ]
+    )
+
+
+_DIRECTION_LABEL = {"in": " (входящие ➕)", "out": " (исходящие ➖)", "all": ""}
+
+
+async def _send_match_card(message: Message, cand) -> None:
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="👥 да, внутрисемейный",
+                    callback_data=f"fam:{cand.my_tx_id}:{cand.partner_tx_id}:y",
+                ),
+                InlineKeyboardButton(
+                    text="нет",
+                    callback_data=f"fam:{cand.my_tx_id}:{cand.partner_tx_id}:n",
+                ),
+            ]
+        ]
+    )
+    await message.answer(
+        f"👥 Похоже на перевод внутри пары: {cand.date} {cand.amount} "
+        f"↔ у {cand.partner_name} встречная операция. Это внутрисемейный "
+        "перевод (не считать в статистике обоих)?",
+        reply_markup=kb,
+    )
+
+
 async def _send_batch(
     message: Message,
     questions: list[QuestionView],
     total: int,
-    keyboards: list[tuple[int, str]],
+    keyboards: dict[str, list[tuple[int, str]]],
 ) -> None:
     for q in questions:
         examples = "\n".join(q.examples)
@@ -308,7 +507,10 @@ async def _send_batch(
             f"❓ <b>{q.display_name}</b>{label} — {q.tx_count} операц.\n{examples}"
         )
         await message.answer(
-            text, reply_markup=_question_kb(q.queue_id, keyboards),
+            text,
+            reply_markup=_question_kb(
+                q.queue_id, keyboards.get(q.direction, keyboards["all"])
+            ),
             parse_mode="HTML",
         )
     remaining = total - len(questions)
@@ -324,15 +526,16 @@ async def cb_answer(query: CallbackQuery) -> None:
 
     def work():
         with _session() as session:
-            user = get_or_create_user(
-                session, query.from_user.id,
-                query.from_user.first_name or "без имени",
-            )
+            user = _user_of(query, session)
             return apply_answer(
                 session, user, int(queue_id), category_id=int(cat_id)
             )
 
-    result = await _run(work)
+    try:
+        result = await _run(work)
+    except ValueError:
+        await query.answer("Эта карточка устарела", show_alert=True)
+        return
     await query.message.edit_text(
         f"✔ {result.display_name} → <b>{result.category_name}</b> "
         f"({result.affected} операц.)",
@@ -347,13 +550,14 @@ async def cb_transit(query: CallbackQuery) -> None:
 
     def work():
         with _session() as session:
-            user = get_or_create_user(
-                session, query.from_user.id,
-                query.from_user.first_name or "без имени",
-            )
+            user = _user_of(query, session)
             return apply_answer(session, user, int(queue_id), transit=True)
 
-    result = await _run(work)
+    try:
+        result = await _run(work)
+    except ValueError:
+        await query.answer("Эта карточка устарела", show_alert=True)
+        return
     await query.message.edit_text(
         f"✔ {result.display_name} → <b>транзит</b> (исключён из статистики, "
         f"{result.affected} операц.)",
@@ -368,13 +572,14 @@ async def cb_netting(query: CallbackQuery) -> None:
 
     def work():
         with _session() as session:
-            user = get_or_create_user(
-                session, query.from_user.id,
-                query.from_user.first_name or "без имени",
-            )
+            user = _user_of(query, session)
             return apply_netting_answer(session, user, int(queue_id), rule)
 
-    name, collapsed = await _run(work)
+    try:
+        name, collapsed = await _run(work)
+    except ValueError:
+        await query.answer("Эта карточка устарела", show_alert=True)
+        return
     if rule == "collapse":
         text = (
             f"✔ {name}: пары возвратов схлопываю и не считаю "
@@ -386,19 +591,45 @@ async def cb_netting(query: CallbackQuery) -> None:
     await query.answer("Запомнил")
 
 
+@dp.callback_query(F.data.startswith("fam:"))
+async def cb_family(query: CallbackQuery) -> None:
+    _, my_id, partner_id, answer = query.data.split(":")
+
+    def work():
+        with _session() as session:
+            user = _user_of(query, session)
+            confirm_match(
+                session, user, int(my_id), int(partner_id), yes=(answer == "y")
+            )
+
+    try:
+        await _run(work)
+    except ValueError:
+        await query.answer("Эта карточка устарела", show_alert=True)
+        return
+    if answer == "y":
+        await query.message.edit_text(
+            "✔ Пометил внутрисемейным — не считается в статистике обоих."
+        )
+    else:
+        await query.message.edit_text("✔ Ок, не внутрисемейный — больше не спрошу.")
+    await query.answer("Запомнил")
+
+
 @dp.callback_query(F.data.startswith("skp:"))
 async def cb_skip(query: CallbackQuery) -> None:
     _, queue_id = query.data.split(":")
 
     def work():
         with _session() as session:
-            user = get_or_create_user(
-                session, query.from_user.id,
-                query.from_user.first_name or "без имени",
-            )
+            user = _user_of(query, session)
             return skip_question(session, user, int(queue_id))
 
-    name = await _run(work)
+    try:
+        name = await _run(work)
+    except ValueError:
+        await query.answer("Эта карточка устарела", show_alert=True)
+        return
     await query.message.edit_text(
         f"⏭ {name} — отложил в конец очереди (/unsorted вернёт)."
     )
@@ -421,15 +652,16 @@ async def custom_category_name(message: Message, state: FSMContext) -> None:
 
     def work():
         with _session() as session:
-            user = get_or_create_user(
-                session, message.from_user.id,
-                message.from_user.first_name or "без имени",
-            )
+            user = _user_of(message, session)
             return apply_answer(
                 session, user, data["queue_id"], custom_name=message.text
             )
 
-    result = await _run(work)
+    try:
+        result = await _run(work)
+    except ValueError:
+        await message.answer("Эта карточка устарела — открой очередь заново: /unsorted")
+        return
     await message.answer(
         f"✔ {result.display_name} → новая категория "
         f"<b>{result.category_name}</b> ({result.affected} операц.)",
@@ -441,13 +673,12 @@ async def custom_category_name(message: Message, state: FSMContext) -> None:
 async def cb_more(query: CallbackQuery) -> None:
     def work():
         with _session() as session:
-            user = get_or_create_user(
-                session, query.from_user.id,
-                query.from_user.first_name or "без имени",
+            user = _user_of(query, session)
+            return (
+                next_questions(session, user, BATCH_SIZE),
+                pending_count(session, user),
+                _keyboards(session, user),
             )
-            return next_questions(session, user, BATCH_SIZE), pending_count(
-                session, user
-            ), _keyboards(session, user)
 
     questions, total, keyboards = await _run(work)
     await query.message.edit_reply_markup(reply_markup=None)
@@ -486,6 +717,17 @@ async def main() -> None:
     dp["session_factory"] = make_session_factory(engine)
 
     bot = Bot(token)
+    await bot.set_my_commands(
+        [
+            BotCommand(command="report", description="Отчёт за месяц"),
+            BotCommand(command="budget", description="Бюджет месяца"),
+            BotCommand(command="unsorted", description="Вопросы по контрагентам"),
+            BotCommand(command="invite", description="Код для связки с партнёром"),
+            BotCommand(command="join", description="Ввести код партнёра"),
+            BotCommand(command="share", description="Что видит партнёр"),
+            BotCommand(command="start", description="Справка"),
+        ]
+    )
     me = await bot.get_me()
     logger.info("Запущен бот @%s (id=%s), long polling", me.username, me.id)
     await dp.start_polling(bot)
